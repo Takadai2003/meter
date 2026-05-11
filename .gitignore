@@ -1,0 +1,10 @@
+/machine1/
+/machine2/
+/multi/cropped/
+/multi/crnn/resized/
+/multi/crnn/datasets/
+/multi/datasets_yolo/
+*.png
+*.jpg
+*.jpeg
+*.mp4

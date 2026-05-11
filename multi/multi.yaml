@@ -1,0 +1,5 @@
+train: datasets_yolo/images/train
+val: datasets_yolo/images/val
+
+nc: 1
+names: ['num']
