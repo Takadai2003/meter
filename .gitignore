@@ -4,6 +4,9 @@
 /multi/crnn/resized/
 /multi/crnn/datasets/
 /multi/datasets_yolo/
+/.vscode/
+/__pycache__/
+/crnn/__pycache__/
 *.png
 *.jpg
 *.jpeg

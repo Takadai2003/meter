@@ -2,16 +2,18 @@ import os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
-from crnn_model import CRNN
+from cnn_transformer import CRNN
 from utils import OCRDataset, collate_fn, IDX2CHAR
 
 IMG_DIR = "crnn/resized"
 LABELS_TXT = "crnn/labels_datasets.txt"
-SAVE_DIR = "crnn/models/hugging_face"
-BATCH = 32
-EPOCHS = 60
-LR = 1e-5
+SAVE_DIR = "crnn/models/hugging_face/Transformer"
+BATCH = 64
+EPOCHS = 50
+LR = 1e-4
 MIN_LR = 1e-6
+WEIGHT_DECAY = 1e-5
+CLIP_NORM = 5.0
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 def calc_input_lengths(widths, max_t=None):
@@ -80,6 +82,9 @@ def targets_to_texts(targets_cat, tgt_lens):
 def main():
     os.makedirs(SAVE_DIR, exist_ok=True)
 
+    if DEVICE == "cuda":
+        torch.backends.cudnn.benchmark = True
+
     ds = OCRDataset(IMG_DIR, LABELS_TXT)
 
     n_val = max(1, int(0.1 * len(ds)))
@@ -96,6 +101,7 @@ def main():
         batch_size=BATCH,
         shuffle=True,
         num_workers=0,
+        pin_memory=(DEVICE == "cuda"),
         collate_fn=collate_fn
     )
 
@@ -104,6 +110,7 @@ def main():
         batch_size=BATCH,
         shuffle=False,
         num_workers=0,
+        pin_memory=(DEVICE == "cuda"),
         collate_fn=collate_fn
     )
 
@@ -111,7 +118,12 @@ def main():
     model = CRNN(nclass=nclass, nc=1).to(DEVICE)
 
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
-    optim = torch.optim.Adam(model.parameters(), lr=LR)
+
+    optim = torch.optim.AdamW(
+        model.parameters(),
+        lr=LR,
+        weight_decay=WEIGHT_DECAY
+    )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optim,
@@ -122,6 +134,13 @@ def main():
     best_acc = -1.0
     best_val_loss = 1e9
 
+    print(f"DEVICE: {DEVICE}")
+    print(f"BATCH: {BATCH}")
+    print(f"EPOCHS: {EPOCHS}")
+    print(f"LR: {LR}")
+    print(f"MIN_LR: {MIN_LR}")
+    print(f"WEIGHT_DECAY: {WEIGHT_DECAY}")
+
     for epoch in range(1, EPOCHS + 1):
         model.train()
         tot_loss = 0.0
@@ -130,14 +149,18 @@ def main():
         for batch in tr_loader:
             imgs, targets_cat, tgt_lens, widths, _ = unpack_batch(batch)
 
-            imgs = imgs.to(DEVICE)
-            targets_cat_device = targets_cat.to(DEVICE)
+            imgs = imgs.to(DEVICE, non_blocking=True)
+            targets_cat_device = targets_cat.to(DEVICE, non_blocking=True)
 
-            logits = model(imgs)
+            inp_lens = calc_input_lengths(widths)
+            seq_lens_device = inp_lens.to(DEVICE, non_blocking=True)
+
+            logits = model(imgs, seq_lens=seq_lens_device)
+
             T, B, C = logits.size()
-            logp = logits.log_softmax(-1)
+            inp_lens = torch.clamp(inp_lens, max=T)
 
-            inp_lens = calc_input_lengths(widths, max_t=T)
+            logp = logits.log_softmax(-1)
 
             loss = criterion(
                 logp,
@@ -146,8 +169,9 @@ def main():
                 tgt_lens
             )
 
-            optim.zero_grad()
+            optim.zero_grad(set_to_none=True)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
             optim.step()
 
             tot_loss += loss.item()
@@ -161,14 +185,18 @@ def main():
             for batch in val_loader:
                 imgs, targets_cat, tgt_lens, widths, _ = unpack_batch(batch)
 
-                imgs = imgs.to(DEVICE)
-                targets_cat_device = targets_cat.to(DEVICE)
+                imgs = imgs.to(DEVICE, non_blocking=True)
+                targets_cat_device = targets_cat.to(DEVICE, non_blocking=True)
 
-                logits = model(imgs)
+                inp_lens = calc_input_lengths(widths)
+                seq_lens_device = inp_lens.to(DEVICE, non_blocking=True)
+
+                logits = model(imgs, seq_lens=seq_lens_device)
+
                 T, B, C = logits.size()
-                logp = logits.log_softmax(-1)
+                inp_lens = torch.clamp(inp_lens, max=T)
 
-                inp_lens = calc_input_lengths(widths, max_t=T)
+                logp = logits.log_softmax(-1)
 
                 loss = criterion(
                     logp,

@@ -33,7 +33,7 @@ def resize_keep_height(img, target_h=32):
     scale = target_h / h
     new_w = max(1, int(round(w * scale)))
 
-    interpolation = cv2.INTER_NEAREST
+    interpolation = cv2.INTER_AREA
 
     img = cv2.resize(
         img,

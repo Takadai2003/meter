@@ -9,11 +9,11 @@ MODEL_PATH = "models/yolo_hf/text-best.pt"
 
 TARGET_HEIGHT = 32
 
-V_TOP_PERCENT = 25
-S_TOP_PERCENT = 15
-HUE_TOL = 2
-MIN_CANDIDATES = 500
-WHITE_S_MAX = 60
+V_TOP_PERCENT = 27
+S_MIN = 45
+HUE_TOL = 3
+MIN_CANDIDATES = 20
+WHITE_S_MAX = 100
 
 OVERWRITE_EXISTING = True
 
@@ -34,14 +34,11 @@ def binarize_auto_hue_from_sv(img):
     s = hsv[:, :, 1]
     v = hsv[:, :, 2]
 
-    max_v = int(np.max(v))
+    max_v = int(np.percentile(v, 97.5))
     v_threshold = max_v * (100 - V_TOP_PERCENT) / 100.0
 
-    max_s = int(np.max(s))
-    s_threshold = max_s * (100 - S_TOP_PERCENT) / 100.0
-
     candidate_mask = (
-        (s >= s_threshold) &
+        (s >= S_MIN) &
         (v >= v_threshold)
     )
 
@@ -115,7 +112,7 @@ image_files = sorted([
 
 print(f"処理開始: {INPUT_DIR}")
 print(f"対象画像数: {len(image_files)}")
-print(f"V_TOP_PERCENT={V_TOP_PERCENT}, S_TOP_PERCENT={S_TOP_PERCENT}, HUE_TOL={HUE_TOL}")
+print(f"V_TOP_PERCENT={V_TOP_PERCENT}, S_MIN={S_MIN}, HUE_TOL={HUE_TOL}")
 
 saved_count = 0
 skipped_count = 0
