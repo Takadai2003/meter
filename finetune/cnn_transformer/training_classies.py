@@ -5,15 +5,13 @@ from torch.utils.data import DataLoader, random_split
 from cnn_transformer import CRNN
 from utils import OCRDataset, collate_fn, IDX2CHAR
 
-IMG_DIR = "learning/resized"
-LABELS_TXT = "learning/labels_datasets.txt"
-SAVE_DIR = "learning/models/hugging_face/Transformer"
+IMG_DIR = "image_processing/finetune_images/left"
+LABELS_TXT = "gemma4/gemma4_labels_left.txt"
+SAVE_DIR = "models/transformer"
 BATCH = 64
 EPOCHS = 50
-LR = 1e-4
-MIN_LR = 1e-6
-WEIGHT_DECAY = 1e-5
-CLIP_NORM = 5.0
+LR = 5e-6
+MIN_LR = 1e-7
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 def calc_input_lengths(widths, max_t=None):
@@ -119,10 +117,9 @@ def main():
 
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
 
-    optim = torch.optim.AdamW(
+    optim = torch.optim.Adam(
         model.parameters(),
-        lr=LR,
-        weight_decay=WEIGHT_DECAY
+        lr=LR
     )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -139,7 +136,6 @@ def main():
     print(f"EPOCHS: {EPOCHS}")
     print(f"LR: {LR}")
     print(f"MIN_LR: {MIN_LR}")
-    print(f"WEIGHT_DECAY: {WEIGHT_DECAY}")
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -171,7 +167,6 @@ def main():
 
             optim.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
             optim.step()
 
             tot_loss += loss.item()
@@ -231,15 +226,11 @@ def main():
         if val_acc > best_acc or (val_acc == best_acc and val_loss < best_val_loss):
             best_acc = val_acc
             best_val_loss = val_loss
-            save_path = os.path.join(SAVE_DIR, "best_datasets.pth")
+            save_path = os.path.join(SAVE_DIR, "best-model_left.pth")
             torch.save(model.state_dict(), save_path)
             print(f"saved {save_path} acc={best_acc:.4f} val_loss={best_val_loss:.4f}")
 
         scheduler.step()
-
-    last_path = os.path.join(SAVE_DIR, "last_datasets.pth")
-    torch.save(model.state_dict(), last_path)
-    print(f"saved {last_path}")
 
 if __name__ == "__main__":
     main()

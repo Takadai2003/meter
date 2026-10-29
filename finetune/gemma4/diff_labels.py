@@ -1,7 +1,7 @@
 import os
 
-GT_LABELS_TXT = "gemma4/labels.txt"
-PRED_LABELS_TXT = "gemma4/gemma4_labels.txt"
+GT_LABELS_TXT = "finetuning/check_labels.txt"
+PRED_LABELS_TXT = "finetuning/output_readings_dark/another_labels.txt"
 
 SHOW_CORRECT = False
 SHOW_MISSING_FILES = False

@@ -1,0 +1,5 @@
+train: datasets3_yolo/images/train
+val: datasets3_yolo/images/val
+
+nc: 2
+names: ['left', 'right']

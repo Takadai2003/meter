@@ -33,8 +33,8 @@ DEFAULT_VALUE_MIN = None
 DEFAULT_VALUE_MAX = None
 
 CLASS_VALUE_RANGES = {
-    "left": (0.0, 9.9),
-    "right": (-6, 5),
+    "left": (1.0, 9.9),
+    "right": (-5, 5),
 }
 
 ADD_RANGE_TO_PROMPT = True
