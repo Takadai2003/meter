@@ -5,7 +5,6 @@
 /__pycache__/
 /crnn/__pycache__/
 /finetune/models/transformer/
-/finetune/main.py/
 *.png
 *.jpg
 *.jpeg

@@ -134,6 +134,7 @@ def choose_start_model_path():
     if USE_LATEST_IF_EXISTS and os.path.exists(LATEST_MODEL_PATH):
         return LATEST_MODEL_PATH
 
+    # BASE_MODEL_PATH = None ならゼロから学習
     return BASE_MODEL_PATH
 
 
@@ -144,6 +145,12 @@ def load_model(nclass):
     ).to(DEVICE)
 
     start_model_path = choose_start_model_path()
+
+    if start_model_path is None:
+        print("開始モデルなし: ゼロから学習します")
+        print(f"CRNN input channels: {INPUT_CHANNELS}")
+
+        return model, None
 
     if not os.path.exists(start_model_path):
         raise FileNotFoundError(
@@ -317,7 +324,7 @@ def main():
     print(f"DATASET_SIZE   : {len(ds)}")
     print(f"TRAIN_SIZE     : {n_tr}")
     print(f"VAL_SIZE       : {n_val}")
-    print(f"START_MODEL    : {start_model_path}")
+    print(f"START_MODEL    : {start_model_path or 'なし（ゼロから学習）'}")
     print(f"BATCH          : {BATCH}")
     print(f"EPOCHS         : {EPOCHS}")
     print(f"LR             : {LR}")

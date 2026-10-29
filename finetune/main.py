@@ -1,5 +1,11 @@
 import os
+import queue
 import sys
+import threading
+import time
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -24,22 +30,18 @@ from finetuning import finetune_color
 #
 # gemma4_labels.py / finetune_color.py の設定のうち、
 # 工程間でそろえる必要があるものをここで上書きする。
-# 抽出FPSや学習率などは各スクリプト側の値を使う。
 # ============================================================
-
-# 自動ラベル付けに使う動画
-VIDEO_PATH = "/mnt/c/Users/大西研究室/Desktop/machine2_slip_train.mp4"
 
 # 表示領域（left / right）を検出するYOLO
 YOLO_MODEL_PATH = "models/yolo_machine2/slip.pt"
 
-# Gemma 4が切り出し画像を保存し、ファインチューニングで読み込むフォルダとラベル
-IMG_DIR = "finetuning/output_readings_slip/train"
-LABELS_TXT = "gemma4/gemma4_labels_slip.txt"
+# カメラ映像から切り出した学習画像とGemma 4のラベル
+IMG_DIR = "finetuning/output_readings_camera"
+LABELS_TXT = "gemma4/gemma4_labels_camera.txt"
 
-# カラー版CNN+Transformer
-BASE_MODEL_PATH = "models/transformer_color/best-model_color_4.pth"
-FINETUNED_SAVE_DIR = "models/finetuning_slip"
+# 学習したカラー版CNN+Transformerの保存先
+# latest.pthがあれば起動時に読み込む。ゼロから学習し直す場合はフォルダを削除する
+FINETUNED_SAVE_DIR = "models/camera"
 LATEST_MODEL_PATH = os.path.join(FINETUNED_SAVE_DIR, "latest.pth")
 
 TARGET_CLASSES = ["left", "right"]
@@ -55,26 +57,47 @@ CLASS_EXPECTED_LABEL_STEPS = {
 }
 
 # 値1種類あたりのラベル枚数
-# MIN: 全ての値がこれに届くまでファインチューニングしない
-# MAX: これに達した値はそれ以上集めない
+# MIN: 全ての値がこれに届いたら学習を始める
+# MAX: これに達した値はそれ以上集めない（学習後も、MAXまでは集め続ける）
 LABEL_MIN_COUNT = 8
-LABEL_MAX_COUNT = 10
-
-RUN_GEMMA_LABELS = True
-RUN_FINETUNING = True
-RUN_LATEST_MODEL_READING = True
-
-REQUIRE_ALL_LABELS_MIN_COUNT = True
+LABEL_MAX_COUNT = 30
 
 
 # ============================================================
-# リアルタイム読み取り
+# カメラ・学習データ収集
 # ============================================================
 
 # カメラ番号、または動画ファイルのパス
 CAMERA_SOURCE = 0
 CAMERA_WIDTH = None
 CAMERA_HEIGHT = None
+
+# Gemma 4にラベル付けさせる間隔（秒）
+COLLECT_INTERVAL_SEC = 1.0
+
+
+# ============================================================
+# 学習
+# ============================================================
+
+# ファインチューニングを行う間隔（分）
+# 前回の学習からこの時間が経ち、新しいラベルが増えていればファインチューニングする
+FINETUNE_INTERVAL_MIN = 30
+
+# 最初の学習（ゼロから）
+SCRATCH_EPOCHS = 50
+SCRATCH_LR = 7e-4
+SCRATCH_MIN_LR = 2e-4
+
+# 定期的なファインチューニング（latest.pthから）
+FINETUNE_EPOCHS = 30
+FINETUNE_LR = 5e-4
+FINETUNE_MIN_LR = 1e-4
+
+
+# ============================================================
+# リアルタイム読み取り
+# ============================================================
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -90,7 +113,6 @@ READING_LOG_TXT = "realtime_latest_reading_log.txt"
 
 
 def configure_steps():
-    gemma4_labels.VIDEO_PATH = VIDEO_PATH
     gemma4_labels.YOLO_MODEL_PATH = YOLO_MODEL_PATH
     gemma4_labels.EXTRACT_DIR = IMG_DIR
     gemma4_labels.LABELS_TXT = LABELS_TXT
@@ -103,18 +125,17 @@ def configure_steps():
     # CLASS_VALUE_RANGESから作られるので、上書き後に作り直す
     gemma4_labels.EXPECTED_LABELS = gemma4_labels.build_expected_labels()
 
-    # 動画から直接ラベル付けし、既存の画像とラベルは消さずに追記する
-    gemma4_labels.RUN_VIDEO_EXTRACTION = True
-    gemma4_labels.RUN_GEMMA_EVAL = True
-    gemma4_labels.CLEAR_EXTRACT_DIR = False
+    # 既存の画像とラベルは消さずに追記する
     gemma4_labels.RESET_LABELS_TXT = False
     gemma4_labels.APPEND_LABELS_TXT = True
 
     finetune_color.IMG_DIR = IMG_DIR
     finetune_color.LABELS_TXT = LABELS_TXT
-    finetune_color.BASE_MODEL_PATH = BASE_MODEL_PATH
     finetune_color.FINETUNED_SAVE_DIR = FINETUNED_SAVE_DIR
     finetune_color.LATEST_MODEL_PATH = LATEST_MODEL_PATH
+
+    # 事前学習モデルは使わず、集めたデータだけで学習する
+    finetune_color.BASE_MODEL_PATH = None
 
 
 def print_step(title):
@@ -136,24 +157,78 @@ def check_gemma_server():
         ) from e
 
 
-def all_labels_min_count_reached():
-    counter, _ = gemma4_labels.load_existing_label_counts(LABELS_TXT)
+class GemmaLabelCollector:
+    """切り出し画像のラベル付けを、映像を止めないよう別スレッドで行う"""
 
-    gemma4_labels.print_label_count_summary(counter)
+    def __init__(self):
+        os.makedirs(IMG_DIR, exist_ok=True)
 
-    missing = []
+        label_counter, existing_files, file_mode = gemma4_labels.prepare_label_file()
+
+        self.label_counter = label_counter
+        self.existing_files = existing_files
+        self.label_file = open(LABELS_TXT, file_mode, encoding="utf-8")
+        self.stats = gemma4_labels.make_empty_stats()
+
+        # メインスレッドが参照する集計。ラベル付けのたびに作り直す
+        self.counts = Counter(label_counter)
+
+        # ラベル付け中はワーカーが、学習中はメインスレッドが持つ
+        self.lock = threading.Lock()
+
+        self.idle = threading.Event()
+        self.idle.set()
+
+        self.queue = queue.Queue()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def submit(self, records):
+        self.idle.clear()
+        self.queue.put(records)
+
+    def _run(self):
+        while True:
+            records = self.queue.get()
+
+            if records is None:
+                return
+
+            for record in records:
+                try:
+                    with self.lock:
+                        gemma4_labels.process_record_for_label(
+                            record=record,
+                            label_file=self.label_file,
+                            label_counter=self.label_counter,
+                            existing_files=self.existing_files,
+                            stats=self.stats
+                        )
+                except Exception as e:
+                    print(f"ラベル付けでエラー: {record['filename']} -> {type(e).__name__}: {e}")
+
+                self.counts = Counter(self.label_counter)
+
+            self.idle.set()
+
+    def close(self):
+        self.queue.put(None)
+        self.thread.join()
+        self.label_file.close()
+
+        gemma4_labels.print_final_summary(self.stats, self.label_counter)
+
+
+def count_ready_labels(counter):
+    ready = 0
 
     for label in gemma4_labels.EXPECTED_LABELS:
         min_count, _ = gemma4_labels.get_label_limits(label)
 
-        if min_count is not None and counter[label] < min_count:
-            missing.append(label)
+        if min_count is None or counter[label] >= min_count:
+            ready += 1
 
-    print("")
-    print(f"期待ラベル数: {len(gemma4_labels.EXPECTED_LABELS)}")
-    print(f"不足ラベル数: {len(missing)}")
-
-    return len(missing) == 0
+    return ready
 
 
 def open_camera():
@@ -225,6 +300,29 @@ def load_crnn_model(model_path):
     model.eval()
 
     return model
+
+
+def train_model(collector, from_scratch):
+    if from_scratch:
+        print_step("集まった学習データでゼロから学習: finetuning/finetune_color.py")
+
+        finetune_color.USE_LATEST_IF_EXISTS = False
+        finetune_color.EPOCHS = SCRATCH_EPOCHS
+        finetune_color.LR = SCRATCH_LR
+        finetune_color.MIN_LR = SCRATCH_MIN_LR
+    else:
+        print_step("latest.pthからファインチューニング: finetuning/finetune_color.py")
+
+        finetune_color.USE_LATEST_IF_EXISTS = True
+        finetune_color.EPOCHS = FINETUNE_EPOCHS
+        finetune_color.LR = FINETUNE_LR
+        finetune_color.MIN_LR = FINETUNE_MIN_LR
+
+    # 学習中はラベル付けを止め、ラベルファイルが書き換わらないようにする
+    with collector.lock:
+        finetune_color.main()
+
+    return load_crnn_model(LATEST_MODEL_PATH)
 
 
 def predict_with_crnn(model, resized_img):
@@ -309,23 +407,58 @@ def get_best_detections_by_class(results, yolo_model):
     return best_by_class
 
 
+def crop_detection(frame, item):
+    x1, y1, x2, y2 = item["xyxy"].astype(int)
+
+    h, w = frame.shape[:2]
+
+    x1 = max(0, min(w - 1, x1))
+    x2 = max(0, min(w, x2))
+    y1 = max(0, min(h - 1, y1))
+    y2 = max(0, min(h, y2))
+
+    if x2 <= x1 or y2 <= y1:
+        return None, None
+
+    return frame[y1:y2, x1:x2], (x1, y1, x2, y2)
+
+
+def save_crops_for_labeling(frame, detections):
+    records = []
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+    for cls_name, item in detections.items():
+        crop, _ = crop_detection(frame, item)
+
+        if crop is None:
+            continue
+
+        filename = f"camera_{timestamp}_{cls_name}.jpg"
+        image_path = os.path.join(IMG_DIR, filename)
+
+        if not cv2.imwrite(image_path, crop):
+            print(f"画像保存失敗: {image_path}")
+            continue
+
+        records.append({
+            "image_path": Path(image_path),
+            "filename": filename,
+            "yolo_class": cls_name,
+            "yolo_conf": item["conf"],
+            "time_sec": ""
+        })
+
+    return records
+
+
 def read_frame_with_latest_model(frame, detections, crnn_model):
     outputs = {}
 
     for cls_name, item in detections.items():
-        x1, y1, x2, y2 = item["xyxy"].astype(int)
+        crop, bbox = crop_detection(frame, item)
 
-        h, w = frame.shape[:2]
-
-        x1 = max(0, min(w - 1, x1))
-        x2 = max(0, min(w, x2))
-        y1 = max(0, min(h - 1, y1))
-        y2 = max(0, min(h, y2))
-
-        if x2 <= x1 or y2 <= y1:
+        if crop is None:
             continue
-
-        crop = frame[y1:y2, x1:x2]
 
         resized = resize_keep_height(
             crop,
@@ -343,7 +476,7 @@ def read_frame_with_latest_model(frame, detections, crnn_model):
         outputs[cls_name] = {
             "text": text,
             "char_confs": char_confs,
-            "bbox": (x1, y1, x2, y2)
+            "bbox": bbox
         }
 
     return outputs
@@ -405,17 +538,24 @@ def draw_result(frame, detections, outputs, reading):
     return vis
 
 
-def realtime_reading_with_latest_model():
-    print("")
-    print("========== latest.pthによるリアルタイム読み取り開始 ==========")
-
-    if not os.path.exists(os.path.join(PROJECT_ROOT, LATEST_MODEL_PATH)):
-        raise FileNotFoundError(
-            f"latestモデルが見つかりません: {os.path.join(PROJECT_ROOT, LATEST_MODEL_PATH)}"
-        )
-
+def run_camera_loop(collector):
     yolo_model = YOLO(os.path.join(PROJECT_ROOT, YOLO_MODEL_PATH))
-    crnn_model = load_crnn_model(LATEST_MODEL_PATH)
+
+    crnn_model = None
+    last_train_time = None
+    labels_at_last_train = 0
+
+    if os.path.exists(LATEST_MODEL_PATH):
+        print("")
+        print(f"既存のモデルを使います: {LATEST_MODEL_PATH}")
+        print(f"ゼロから学習し直す場合は {FINETUNED_SAVE_DIR} を削除してください。")
+
+        crnn_model = load_crnn_model(LATEST_MODEL_PATH)
+        last_train_time = time.monotonic()
+        labels_at_last_train = sum(collector.counts.values())
+
+    expected_count = len(gemma4_labels.EXPECTED_LABELS)
+    last_ready_count = None
 
     cap = open_camera()
 
@@ -424,12 +564,13 @@ def realtime_reading_with_latest_model():
     if SAVE_READING_LOG:
         log_file = open(
             os.path.join(PROJECT_ROOT, READING_LOG_TXT),
-            "w",
+            "a",
             encoding="utf-8"
         )
 
     frame_index = 0
     last_process_time = 0.0
+    last_collect_time = 0.0
 
     try:
         while True:
@@ -439,11 +580,11 @@ def realtime_reading_with_latest_model():
                 print("カメラフレームを取得できませんでした。")
                 break
 
-            now = cv2.getTickCount() / cv2.getTickFrequency()
+            now = time.monotonic()
 
             if now - last_process_time < 1.0 / max(REALTIME_FPS, 1e-6):
                 if SHOW_WINDOW:
-                    cv2.imshow("latest realtime reading", frame)
+                    cv2.imshow("camera", frame)
 
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
@@ -461,19 +602,68 @@ def realtime_reading_with_latest_model():
 
             detections = get_best_detections_by_class(results, yolo_model)
 
-            outputs = read_frame_with_latest_model(
-                frame=frame,
-                detections=detections,
-                crnn_model=crnn_model
-            )
+            # ------------------------------------------------
+            # 学習データ収集（Gemma 4は別スレッド）
+            # ------------------------------------------------
+            counts = collector.counts
 
-            reading = format_reading(outputs)
+            if (
+                len(detections) > 0
+                and collector.idle.is_set()
+                and now - last_collect_time >= COLLECT_INTERVAL_SEC
+                and not gemma4_labels.is_all_expected_labels_max_reached(counts)
+            ):
+                records = save_crops_for_labeling(frame, detections)
 
-            print(f"[frame={frame_index}] {reading}")
+                if len(records) > 0:
+                    collector.submit(records)
+                    last_collect_time = now
 
-            if log_file is not None:
-                log_file.write(f"{frame_index} {reading}\n")
-                log_file.flush()
+            ready_count = count_ready_labels(counts)
+
+            if ready_count != last_ready_count:
+                print(f"学習データ: {ready_count}/{expected_count} 種類の値が {LABEL_MIN_COUNT} 枚に到達")
+                last_ready_count = ready_count
+
+            # ------------------------------------------------
+            # 学習
+            # ------------------------------------------------
+            if crnn_model is None and ready_count == expected_count:
+                crnn_model = train_model(collector, from_scratch=True)
+                last_train_time = time.monotonic()
+                labels_at_last_train = sum(collector.counts.values())
+                continue
+
+            if (
+                crnn_model is not None
+                and time.monotonic() - last_train_time >= FINETUNE_INTERVAL_MIN * 60
+                and sum(collector.counts.values()) > labels_at_last_train
+            ):
+                crnn_model = train_model(collector, from_scratch=False)
+                last_train_time = time.monotonic()
+                labels_at_last_train = sum(collector.counts.values())
+                continue
+
+            # ------------------------------------------------
+            # 読み取り
+            # ------------------------------------------------
+            if crnn_model is None:
+                outputs = {}
+                reading = f"collecting: {ready_count}/{expected_count}"
+            else:
+                outputs = read_frame_with_latest_model(
+                    frame=frame,
+                    detections=detections,
+                    crnn_model=crnn_model
+                )
+
+                reading = format_reading(outputs)
+
+                print(f"[frame={frame_index}] {reading}")
+
+                if log_file is not None:
+                    log_file.write(f"{datetime.now().isoformat(timespec='seconds')} {reading}\n")
+                    log_file.flush()
 
             if SHOW_WINDOW:
                 vis = draw_result(
@@ -483,7 +673,7 @@ def realtime_reading_with_latest_model():
                     reading=reading
                 )
 
-                cv2.imshow("latest realtime reading", vis)
+                cv2.imshow("camera", vis)
 
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
@@ -497,8 +687,6 @@ def realtime_reading_with_latest_model():
         if SHOW_WINDOW:
             cv2.destroyAllWindows()
 
-    print("========== latest.pthによるリアルタイム読み取り終了 ==========")
-
 
 def main():
     # 各スクリプトのパスはfinetune/からの相対パス
@@ -509,37 +697,22 @@ def main():
     print("========== main.py start ==========")
     print(f"PROJECT_ROOT: {PROJECT_ROOT}")
     print(f"DEVICE: {DEVICE}")
-    print(f"VIDEO_PATH: {VIDEO_PATH}")
+    print(f"CAMERA_SOURCE: {CAMERA_SOURCE}")
     print(f"IMG_DIR: {IMG_DIR}")
     print(f"LABELS_TXT: {LABELS_TXT}")
-    print(f"BASE_MODEL_PATH: {BASE_MODEL_PATH}")
     print(f"LATEST_MODEL_PATH: {LATEST_MODEL_PATH}")
+    print(f"LABEL_MIN_COUNT: {LABEL_MIN_COUNT}")
+    print(f"LABEL_MAX_COUNT: {LABEL_MAX_COUNT}")
+    print(f"FINETUNE_INTERVAL_MIN: {FINETUNE_INTERVAL_MIN}")
 
-    if RUN_GEMMA_LABELS:
-        check_gemma_server()
+    check_gemma_server()
 
-        print_step("Gemma 4による自動ラベル付け: gemma4/gemma4_labels.py")
-        gemma4_labels.main()
+    collector = GemmaLabelCollector()
 
-    if REQUIRE_ALL_LABELS_MIN_COUNT and not all_labels_min_count_reached():
-        print("")
-        print("全ラベルがLABEL_MIN_COUNTに到達していません。")
-        print("ファインチューニングとlatestモデルでのリアルタイム読み取りは実行せずに終了します。")
-        print("")
-        print("対処方法:")
-        print("1. VIDEO_PATHを別の動画に変えてmain.pyを再実行し、ラベルを追記で集める")
-        print("2. LABEL_MIN_COUNTを下げる")
-        print("3. CLASS_VALUE_RANGESを実際に出現する範囲に絞る")
-        print("4. REQUIRE_ALL_LABELS_MIN_COUNT=Falseにして、今あるラベルでファインチューニングする")
-        print("========== main.py finished ==========")
-        return
-
-    if RUN_FINETUNING:
-        print_step("カラー版ファインチューニング: finetuning/finetune_color.py")
-        finetune_color.main()
-
-    if RUN_LATEST_MODEL_READING:
-        realtime_reading_with_latest_model()
+    try:
+        run_camera_loop(collector)
+    finally:
+        collector.close()
 
     print("")
     print("========== main.py finished ==========")

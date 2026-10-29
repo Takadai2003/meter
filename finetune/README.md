@@ -5,21 +5,21 @@
 
 - **YOLO** で表示領域（`left` / `right`）を検出
 - **CNN + Transformer（CTC）** で切り出した領域の数字列を認識
-- 新しい撮影条件に適応させるため、ローカルで動かす **Gemma 4（llama.cpp）** で切り出し画像に自動でラベルを付け、そのラベルで認識モデルをファインチューニング
+- カメラ映像の切り出し画像に、ローカルで動かす **Gemma 4（llama.cpp）** で自動的にラベルを付け、集まったデータで認識モデルをゼロから学習。読み取り中もラベルを集め続け、一定間隔でファインチューニング
 
 ## 処理の流れ
 
 ```mermaid
 flowchart LR
-    V[計測器の動画] --> Y[YOLO<br/>left / right 検出]
+    V[カメラ映像] --> Y[YOLO<br/>left / right 検出]
     Y --> C[切り出し画像]
     C --> G[Gemma 4<br/>自動ラベル付け]
     G --> L[ラベル<br/>画像名 値]
-    C --> P[前処理<br/>高さ 32 px]
-    L --> F[CNN+Transformer<br/>ファインチューニング]
-    P --> F
+    L -->|全ての値がそろったら| F[CNN+Transformer<br/>学習（最初はゼロから）]
     F --> M[latest.pth]
-    M --> R[カメラ映像の<br/>リアルタイム読み取り]
+    M --> R[リアルタイム読み取り]
+    C --> R
+    R -.->|一定間隔で| F
 ```
 
 ## 認識モデル（CNN + Transformer）
@@ -43,7 +43,7 @@ flowchart LR
 
 ```
 finetune/
-├── main.py                 # 一括実行（カラー版）：自動ラベル付け → ファインチューニング → リアルタイム読み取り
+├── main.py                 # カメラ映像からラベル収集 → 学習 → リアルタイム読み取り（カラー版）
 ├── frame.py                # 動画からフレームを抽出（YOLO アノテーション用）
 ├── yolo_video.py           # YOLO で検出した表示領域を動画から切り出す
 ├── generate_labels.py      # カラー版モデルで動画を読み取り、切り出し画像とラベルを出力
@@ -147,30 +147,38 @@ yolo detect train model=models/yolo_machine2/text-best.pt data=multi.yaml \
 
 出力したファイルを [gemma4/diff_labels.py](gemma4/diff_labels.py) で正解ラベルと比較します。
 
-### 6. 一括実行とリアルタイム読み取り（カラー版）
+### 6. カメラ映像での学習データ収集・学習・リアルタイム読み取り（カラー版）
 
-[main.py](main.py) は、次の工程を順に実行します。
+[main.py](main.py) は、カメラ映像を処理し続けながら、次の順に進みます。
 
-1. Gemma 4 による自動ラベル付け（[gemma4/gemma4_labels.py](gemma4/gemma4_labels.py)）
-2. ラベル数の確認
-3. カラー版のファインチューニング（[finetuning/finetune_color.py](finetuning/finetune_color.py)）
-4. ファインチューニングしたモデル（`latest.pth`）による、カメラ映像のリアルタイム読み取り
+1. **収集**: YOLO で切り出した画像を `COLLECT_INTERVAL_SEC` 秒ごとに Gemma 4 に渡し、ラベルを付ける。Gemma 4 の処理は別スレッドで行うので、映像は止まらない
+2. **最初の学習**: 想定するすべての値が `LABEL_MIN_COUNT` 枚に届いたら、集めたデータだけでカラー版モデルをゼロから学習する（事前学習モデルは使わない）
+3. **読み取り**: 学習したモデル（`latest.pth`）で読み取る。読み取り中もラベルを集め続ける
+4. **ファインチューニング**: 前回の学習から `FINETUNE_INTERVAL_MIN` 分が経ち、新しいラベルが増えていれば、`latest.pth` からファインチューニングして読み取りに戻る
 
 ```bash
 cd finetune
 python main.py
 ```
 
-`main.py` は各スクリプトを import して実行します。
-工程間でそろえる必要がある設定（動画、YOLO モデル、画像フォルダ、ラベルファイル、開始モデル、保存先、値の範囲、ラベル枚数）は、`main.py` 先頭の値で各スクリプトの設定を上書きします。
-抽出 FPS や学習率などの細かい設定は、それぞれのスクリプトの値が使われます。
+`main.py` は [gemma4/gemma4_labels.py](gemma4/gemma4_labels.py) と [finetuning/finetune_color.py](finetuning/finetune_color.py) を import して使います。
+工程間でそろえる必要がある設定（YOLO モデル、画像フォルダ、ラベルファイル、保存先、値の範囲、ラベル枚数、学習のエポック数と学習率）は、`main.py` 先頭の値で各スクリプトの設定を上書きします。
 
-- 先に llama-server を起動しておいてください。接続できない場合は、ラベル付けを始める前にエラーで止まります。
-- ラベルは追記で集めます。既存の画像とラベルは消しません。`VIDEO_PATH` を変えて再実行すれば、別の動画からラベルを追加できます。
-- すべての値のラベル数が `LABEL_MIN_COUNT` に届いていない場合は、ファインチューニング以降を実行せずに終了します。`REQUIRE_ALL_LABELS_MIN_COUNT = False` にすると、今あるラベルで学習に進みます。
-- 各工程は `RUN_GEMMA_LABELS`、`RUN_FINETUNING`、`RUN_LATEST_MODEL_READING` で個別にオン・オフできます。
-- リアルタイム読み取りは `CAMERA_SOURCE`（カメラ番号、または動画ファイルのパス）から映像を読み、`9.4×10^4` のように表示します。`q` キーで終了します。
-- 読み値は `realtime_latest_reading_log.txt` にも記録されます。
+| 変数 | 内容 |
+| --- | --- |
+| `CAMERA_SOURCE` | カメラ番号、または動画ファイルのパス |
+| `LABEL_MIN_COUNT` | 値 1 種類あたり、この枚数がそろったら最初の学習を始める |
+| `LABEL_MAX_COUNT` | 値 1 種類あたり、この枚数に達したらそれ以上集めない |
+| `COLLECT_INTERVAL_SEC` | Gemma 4 にラベル付けさせる間隔（秒） |
+| `FINETUNE_INTERVAL_MIN` | ファインチューニングを行う間隔（分） |
+| `SCRATCH_*` / `FINETUNE_*` | 最初の学習／ファインチューニングのエポック数と学習率 |
+
+- 先に llama-server を起動しておいてください。接続できない場合は、起動時にエラーで止まります。
+- 学習中は映像の処理が止まり、学習が終わると再開します。
+- `CLASS_VALUE_RANGES` には、実際に表示される値の範囲を指定してください。範囲内に表示されない値があると、いつまでも最初の学習が始まりません。
+- 画像とラベルは追記で保存し、既存のものは消しません。再起動すると、`models/camera/latest.pth` があればそれを読み込んで読み取りから再開します。ゼロから学習し直す場合は `models/camera/` を削除してください。
+- 映像には検出枠と読み値（`9.4×10^4` など）を表示します。`q` キーで終了します。
+- 読み値は時刻付きで `realtime_latest_reading_log.txt` に追記されます。
 
 ## ラベルファイルの形式
 
@@ -181,7 +189,7 @@ machine2_3h_t000.51s_left.jpg 9.4
 machine2_3h_t001.02s_right.jpg 4
 ```
 
-切り出し画像のファイル名は `<動画名>_t<秒>s_<クラス>.jpg` です。
+切り出し画像のファイル名は、動画から切り出した場合は `<動画名>_t<秒>s_<クラス>.jpg`、`main.py` でカメラ映像から切り出した場合は `camera_<日時>_<クラス>.jpg` です。
 
 ## 学習済みモデル
 
@@ -195,16 +203,17 @@ machine2_3h_t001.02s_right.jpg 4
 | `models/transformer/finetuned-models/` | グレースケール版のファインチューニング結果 |
 | `models/transformer_color/` | カラー版 |
 | `models/finetuning_dark/`、`models/finetuning_slip/` | 撮影条件ごとのファインチューニング結果（カラー版） |
+| `models/camera/` | `main.py` がカメラ映像から集めたデータで学習したモデル（実行時に作られる） |
 
 `.pth` は `state_dict` のみを保存しています。読み込み例:
 
 ```python
 import torch
-from cnn_transformer.cnn_transformer import CRNN
-from cnn_transformer.utils import ALPHABET
+from cnn_transformer_color.cnn_transformer import CRNN
+from cnn_transformer_color.utils import ALPHABET
 
-model = CRNN(nclass=len(ALPHABET) + 1, nc=1)  # カラー版は nc=3
-model.load_state_dict(torch.load("models/transformer/hf_base-model.pth", map_location="cpu"))
+model = CRNN(nclass=len(ALPHABET) + 1, nc=3)  # グレースケール版は cnn_transformer から読み込み nc=1
+model.load_state_dict(torch.load("models/finetuning_slip/latest.pth", map_location="cpu"))
 model.eval()
 ```
 
